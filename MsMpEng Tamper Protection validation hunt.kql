@@ -1,0 +1,19 @@
+DeviceRegistryEvents
+| where Timestamp > ago(24h)
+| where RegistryKey has @"\SOFTWARE\Microsoft\Windows Defender\Features"
+| where RegistryValueName =~ "TamperProtection"
+| where RegistryValueData == "0"
+| where InitiatingProcessFileName =~ "MsMpEng.exe"
+| project
+    Timestamp,
+    DeviceName,
+    DeviceId,
+    ReportId,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    PreviousRegistryValueData,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    InitiatingProcessAccountName
