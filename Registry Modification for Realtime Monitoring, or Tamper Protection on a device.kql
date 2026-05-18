@@ -1,0 +1,233 @@
+// Rule name:
+// MDE - Suspicious Defender Registry Modification - Tuned
+
+// Goal:
+// Detect suspicious Defender registry tampering while suppressing legitimate
+// policy enforcement and Defender internal state writes.
+
+// Recommended severity:
+// High
+
+let RegistryActionTypes = dynamic([
+    "RegistryValueSet",
+    "RegistryValueCreated",
+    "RegistryValueDeleted"
+]);
+
+let SuspiciousProcessNames = dynamic([
+    "powershell.exe",
+    "powershell_ise.exe",
+    "pwsh.exe",
+    "cmd.exe",
+    "reg.exe",
+    "regini.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+    "rundll32.exe",
+    "wmic.exe",
+    "wmiprvse.exe",
+    "psexesvc.exe",
+    "schtasks.exe",
+    "sc.exe",
+    "msiexec.exe",
+    "installutil.exe"
+]);
+
+let SuspiciousCommandLineTerms = dynamic([
+    "set-mppreference",
+    "add-mppreference",
+    "disablerealtimemonitoring",
+    "disableantispyware",
+    "tamperprotection",
+    "passiveremediation",
+    "windows defender",
+    "microsoft\\windows defender"
+]);
+
+let SafePassiveRemediationValues = dynamic([
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7"
+]);
+
+DeviceRegistryEvents
+| where Timestamp > ago(2h)
+| where ActionType in~ (RegistryActionTypes)
+| where RegistryKey has_any (
+    @"\SOFTWARE\Policies\Microsoft\Windows Defender",
+    @"\SOFTWARE\Microsoft\Windows Defender"
+)
+| where
+    RegistryValueName in~ (
+        "DisableRealtimeMonitoring",
+        "DisableRealTimeMonitoring",
+        "PassiveRemediation",
+        "TamperProtection"
+    )
+    or RegistryKey has "TamperProtection"
+
+| extend RegistryValueDataString = trim(" ", replace_regex(tostring(RegistryValueData), @"\.0$", ""))
+| extend PreviousRegistryValueDataString = trim(" ", replace_regex(tostring(PreviousRegistryValueData), @"\.0$", ""))
+| extend RegistryValueDataInt = toint(RegistryValueDataString)
+| extend RegistryKeyLower = tolower(tostring(RegistryKey))
+| extend RegistryValueNameLower = tolower(tostring(RegistryValueName))
+| extend InitiatingProcessFileNameLower = tolower(tostring(InitiatingProcessFileName))
+| extend InitiatingProcessCommandLineLower = tolower(tostring(InitiatingProcessCommandLine))
+| extend InitiatingProcessParentFileNameLower = tolower(tostring(InitiatingProcessParentFileName))
+| extend InitiatingProcessAccountNameLower = tolower(tostring(InitiatingProcessAccountName))
+
+// Legitimate Group Policy Client pattern seen in reports.
+| extend IsGpsvcPolicyEngine =
+    InitiatingProcessFileNameLower == "svchost.exe"
+    and InitiatingProcessParentFileNameLower == "services.exe"
+    and InitiatingProcessAccountNameLower == "system"
+    and InitiatingProcessCommandLineLower has_any ("gpsvc", "gpsvcgroup")
+
+// Defender engine internal state write.
+// Keep it visible in a separate validation hunt.
+| extend IsMsMpEngInternalTamperStateWrite =
+    InitiatingProcessFileNameLower == "msmpeng.exe"
+    and InitiatingProcessParentFileNameLower == "services.exe"
+    and InitiatingProcessAccountNameLower == "system"
+    and RegistryValueNameLower == "tamperprotection"
+    and RegistryValueDataInt == 0
+    and RegistryKeyLower has @"\microsoft\windows defender\features"
+
+// Normal / expected policy enforcement.
+| extend IsSafeRealtimeProtectionPolicy =
+    RegistryValueNameLower == "disablerealtimemonitoring"
+    and RegistryValueDataInt == 0
+    and IsGpsvcPolicyEngine
+
+// PassiveRemediation controls automatic remediation for Sense scans.
+// Values 1, 2, and 4 are documented flags; 3, 5, 6, 7 are possible combined bit flags.
+| extend IsSafePassiveRemediationPolicy =
+    RegistryValueNameLower == "passiveremediation"
+    and RegistryValueDataString in (SafePassiveRemediationValues)
+    and IsGpsvcPolicyEngine
+
+// Suspicious conditions.
+| extend IsRealtimeProtectionDisabled =
+    RegistryValueNameLower == "disablerealtimemonitoring"
+    and RegistryValueDataInt == 1
+
+| extend IsRealtimeProtectionValueDeleted =
+    RegistryValueNameLower == "disablerealtimemonitoring"
+    and ActionType =~ "RegistryValueDeleted"
+
+| extend IsPassiveRemediationDisabled =
+    RegistryValueNameLower == "passiveremediation"
+    and RegistryValueDataInt == 0
+    and (
+        PreviousRegistryValueDataString in (SafePassiveRemediationValues)
+        or not(IsGpsvcPolicyEngine)
+    )
+
+| extend IsPassiveRemediationDeleted =
+    RegistryValueNameLower == "passiveremediation"
+    and ActionType =~ "RegistryValueDeleted"
+
+| extend IsTamperProtectionDisabledOrDeleted =
+    RegistryValueNameLower == "tamperprotection"
+    and RegistryKeyLower has @"\microsoft\windows defender\features"
+    and (
+        RegistryValueDataInt == 0
+        or ActionType =~ "RegistryValueDeleted"
+    )
+
+| extend IsSuspiciousTool =
+    InitiatingProcessFileNameLower in~ (SuspiciousProcessNames)
+
+| extend HasSuspiciousCommandLine =
+    InitiatingProcessCommandLineLower has_any (SuspiciousCommandLineTerms)
+
+// Keep non-standard writes visible, but alert only when they perform a risky change.
+| extend IsNonGpsvcPolicyWriteToWatchedValue =
+    not(IsGpsvcPolicyEngine)
+    and not(IsMsMpEngInternalTamperStateWrite)
+    and (
+        IsSuspiciousTool
+        or HasSuspiciousCommandLine
+    )
+
+| extend IsRiskyDefenderPolicyChange =
+    IsRealtimeProtectionDisabled
+    or IsRealtimeProtectionValueDeleted
+    or IsPassiveRemediationDisabled
+    or IsPassiveRemediationDeleted
+    or IsTamperProtectionDisabledOrDeleted
+
+| extend IsNonGpsvcRiskyPolicyWrite =
+    IsNonGpsvcPolicyWriteToWatchedValue
+    and IsRiskyDefenderPolicyChange
+
+// Suppress legitimate policy enforcement and Defender internal state noise.
+| where not(IsSafeRealtimeProtectionPolicy)
+| where not(IsSafePassiveRemediationPolicy)
+| where not(IsMsMpEngInternalTamperStateWrite)
+
+// Keep only suspicious activity.
+| where
+    IsRiskyDefenderPolicyChange
+    or IsNonGpsvcRiskyPolicyWrite
+
+| extend RiskyChangeReason = case(
+    IsRealtimeProtectionDisabled,
+        "Microsoft Defender real-time protection was disabled through registry policy",
+    IsRealtimeProtectionValueDeleted,
+        "Microsoft Defender real-time protection policy value was deleted",
+    IsPassiveRemediationDisabled,
+        "Microsoft Defender PassiveRemediation was changed to disabled",
+    IsPassiveRemediationDeleted,
+        "Microsoft Defender PassiveRemediation policy value was deleted",
+    IsTamperProtectionDisabledOrDeleted,
+        "Microsoft Defender TamperProtection was disabled or deleted",
+    "Suspicious Defender registry modification"
+)
+
+| extend DetectionReason = iff(
+    IsNonGpsvcRiskyPolicyWrite,
+    strcat(RiskyChangeReason, " by non-GPSvc process: ", InitiatingProcessFileName),
+    RiskyChangeReason
+)
+
+| extend Severity = case(
+    IsRealtimeProtectionDisabled, "High",
+    IsTamperProtectionDisabledOrDeleted and IsSuspiciousTool, "High",
+    IsTamperProtectionDisabledOrDeleted, "Medium",
+    IsRealtimeProtectionValueDeleted, "Medium",
+    IsPassiveRemediationDisabled, "Medium",
+    IsPassiveRemediationDeleted, "Medium",
+    IsNonGpsvcRiskyPolicyWrite, "Medium",
+    "Medium"
+)
+
+| project
+    Timestamp,
+    DeviceId,
+    ReportId,
+    DeviceName,
+    ActionType,
+    RegistryKey,
+    RegistryValueName,
+    RegistryValueData,
+    PreviousRegistryValueData,
+    DetectionReason,
+    Severity,
+    IsGpsvcPolicyEngine,
+    IsSuspiciousTool,
+    HasSuspiciousCommandLine,
+    IsNonGpsvcPolicyWriteToWatchedValue,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    InitiatingProcessAccountDomain,
+    InitiatingProcessAccountName,
+    InitiatingProcessAccountSid,
+    InitiatingProcessId,
+    InitiatingProcessParentId

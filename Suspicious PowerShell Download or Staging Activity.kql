@@ -1,0 +1,395 @@
+// Rule name:
+// MDE - Suspicious PowerShell Download or Staging Activity - Tuned v4
+
+// Goal:
+// Detect suspicious PowerShell download cradles, encoded commands,
+// staging, and execution behavior while suppressing confirmed legitimate
+// SCCM, Azure Arc Guest Configuration, and Microsoft Defender for Endpoint
+// PSScript execution noise.
+
+// Recommended severity:
+// High or Medium, depending on alert policy.
+
+let PowerShellNames = dynamic([
+    "powershell.exe",
+    "powershell_ise.exe",
+    "pwsh.exe"
+]);
+
+let SuspiciousParents = dynamic([
+    "winword.exe",
+    "excel.exe",
+    "powerpnt.exe",
+    "outlook.exe",
+    "onenote.exe",
+    "teams.exe",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "mshta.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "rundll32.exe",
+    "regsvr32.exe",
+    "wmic.exe",
+    "wmiprvse.exe",
+    "psexesvc.exe",
+    "schtasks.exe",
+    "msbuild.exe",
+    "installutil.exe",
+    "forfiles.exe"
+]);
+
+let DownloadCradleTerms = dynamic([
+    "invoke-webrequest",
+    "invoke-restmethod",
+    "downloadstring",
+    "downloadfile",
+    "downloaddata",
+    "system.net.webclient",
+    "system.net.httpclient",
+    "net.webrequest",
+    "start-bitstransfer",
+    "bitsadmin",
+    "certutil",
+    "curl",
+    "wget"
+]);
+
+let ExecutionTerms = dynamic([
+    "iex",
+    "invoke-expression",
+    "start-process",
+    "rundll32",
+    "regsvr32",
+    "mshta",
+    "wscript",
+    "cscript",
+    "cmd.exe"
+]);
+
+let EvasionTerms = dynamic([
+    "-executionpolicy bypass",
+    "-executionpolicy unrestricted",
+    "-ep bypass",
+    "-ep unrestricted",
+    " -nop ",
+    "-noprofile",
+    "-noninteractive",
+    "-windowstyle hidden",
+    "-w hidden",
+    "-sta",
+    "-mta"
+]);
+
+let FileStagingTerms = dynamic([
+    "-outfile",
+    "out-file",
+    "set-content",
+    "add-content",
+    "new-item",
+    "expand-archive",
+    "$env:temp",
+    "\\temp\\",
+    "\\appdata\\",
+    "\\programdata\\",
+    "\\users\\public\\",
+    "\\windows\\tasks\\"
+]);
+
+let SuspiciousDownloadExtensions = dynamic([
+    ".ps1",
+    ".psm1",
+    ".vbs",
+    ".js",
+    ".jse",
+    ".hta",
+    ".bat",
+    ".cmd",
+    ".exe",
+    ".dll",
+    ".zip",
+    ".7z",
+    ".rar"
+]);
+
+DeviceProcessEvents
+| where Timestamp > ago(2h)
+| where FileName in~ (PowerShellNames)
+
+| extend ProcessCommandLineLower = replace_regex(tolower(tostring(ProcessCommandLine)), @"\s+", " ")
+| extend FolderPathLower = tolower(tostring(FolderPath))
+| extend InitiatingProcessFileNameLower = tolower(tostring(InitiatingProcessFileName))
+| extend InitiatingProcessCommandLineLower = replace_regex(tolower(tostring(InitiatingProcessCommandLine)), @"\s+", " ")
+| extend InitiatingProcessParentFileNameLower = tolower(tostring(InitiatingProcessParentFileName))
+| extend InitiatingProcessAccountNameLower = tolower(tostring(InitiatingProcessAccountName))
+
+// URL indicators.
+| extend HasUrl =
+    ProcessCommandLineLower matches regex @"https?://"
+
+| extend HasLocalhostUrl =
+    ProcessCommandLineLower contains "http://localhost"
+    or ProcessCommandLineLower contains "https://localhost"
+    or ProcessCommandLineLower contains "http://127.0.0.1"
+    or ProcessCommandLineLower contains "https://127.0.0.1"
+    or ProcessCommandLineLower contains "http://[::1]"
+    or ProcessCommandLineLower contains "https://[::1]"
+
+| extend HasPrivateIpUrl =
+    ProcessCommandLineLower matches regex @"https?://(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.)"
+
+| extend HasExternalUrl =
+    HasUrl and not(HasLocalhostUrl)
+
+| extend HasPublicUrl =
+    HasExternalUrl and not(HasPrivateIpUrl)
+
+// Download indicators.
+| extend HasDownloadCradle =
+    ProcessCommandLineLower has_any (DownloadCradleTerms)
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])iwr($|[\s;`|&-])"
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])irm($|[\s;`|&-])"
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])wget($|[\s;`|&-])"
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])curl($|[\s;`|&-])"
+
+| extend HasSuspiciousDownloadExtension =
+    ProcessCommandLineLower has_any (SuspiciousDownloadExtensions)
+
+// Execution indicators.
+| extend HasExecution =
+    ProcessCommandLineLower has_any (ExecutionTerms)
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])iex($|[\s;`|&])"
+
+// Obfuscation indicators.
+// Important:
+// Do NOT use generic "base64" here because MDE legitimate scripts use -ParamsAsBase64.
+| extend HasEncodingOrObfuscation =
+    ProcessCommandLineLower contains "-encodedcommand"
+    or ProcessCommandLineLower contains " -enc "
+    or ProcessCommandLineLower matches regex @"(^|[\s;`|&])-e(nc|nco|ncod|ncode|ncodedcommand)?($|[\s;`|&])"
+    or ProcessCommandLineLower contains "frombase64string"
+    or ProcessCommandLineLower contains "[convert]::frombase64string"
+    or ProcessCommandLineLower contains "[system.convert]::frombase64string"
+    or ProcessCommandLineLower contains " -join "
+    or ProcessCommandLineLower contains "[char]"
+    or ProcessCommandLineLower contains "`"
+
+// Evasion indicators.
+| extend HasEvasion =
+    ProcessCommandLineLower has_any (EvasionTerms)
+
+// File staging indicators.
+| extend HasFileStaging =
+    ProcessCommandLineLower has_any (FileStagingTerms)
+    or (HasDownloadCradle and HasSuspiciousDownloadExtension)
+
+// Suppression 1:
+// Azure Arc Guest Configuration compliance check.
+| extend IsAzureArcGuestConfigurationOsVersionCheck =
+    InitiatingProcessFileNameLower == "gc_worker.exe"
+    and InitiatingProcessCommandLineLower contains "windowsdefenderexploitguard"
+    and InitiatingProcessCommandLineLower contains "guestconfiguration.azure.com"
+    and ProcessCommandLineLower contains "-encodedcommand"
+    and ProcessCommandLineLower contains "iabbaeua"
+    and ProcessCommandLineLower contains "-inputformat xml"
+    and not(HasExternalUrl)
+    and not(HasDownloadCradle)
+    and not(HasExecution)
+    and not(HasFileStaging)
+
+// Suppression 2:
+// SCCM / Configuration Manager Delivery Optimization inventory check.
+| extend IsSccmDeliveryOptimizationStatusCheck =
+    InitiatingProcessFileNameLower == "ccmexec.exe"
+    and ProcessCommandLineLower contains "get-deliveryoptimizationstatus"
+    and ProcessCommandLineLower contains "sourceurl"
+    and ProcessCommandLineLower contains "http://localhost:8005"
+    and ProcessCommandLineLower contains "convertto-xml"
+    and not(HasExecution)
+    and not(HasEncodingOrObfuscation)
+    and not(HasDownloadCradle)
+    and not(HasFileStaging)
+
+// Suppression 3:
+// Microsoft Defender for Endpoint managed PowerShell script execution.
+// Suppress MDE PSScript execution from the Defender ATP folder.
+| extend IsMdeManagedPowerShellScript =
+    ProcessCommandLineLower contains @"c:\programdata\microsoft\windows defender advanced threat protection\downloads\psscript_"
+    and ProcessCommandLineLower contains ".ps1"
+    and ProcessCommandLineLower contains "-paramsasbase64"
+    and (
+        InitiatingProcessFileNameLower in~ ("senseir.exe", "powershell.exe", "mssense.exe")
+        or InitiatingProcessCommandLineLower contains @"windows defender advanced threat protection"
+    )
+    and not(HasExternalUrl)
+    and not(HasDownloadCradle)
+    and not(ProcessCommandLineLower contains "frombase64string")
+    and not(ProcessCommandLineLower contains "[convert]::frombase64string")
+    and not(ProcessCommandLineLower contains "[system.convert]::frombase64string")
+
+// Suppression 4:
+// Microsoft Defender for Endpoint script wrapper with hash verification/transcript.
+| extend IsMdePowerShellScriptWrapper =
+    ProcessCommandLineLower contains @"c:\programdata\microsoft\windows defender advanced threat protection\downloads\psscript_"
+    and ProcessCommandLineLower contains "get-filehash"
+    and ProcessCommandLineLower contains @"c:\programdata\microsoft\windows defender advanced threat protection\temp\psscriptoutputs"
+    and (
+        InitiatingProcessFileNameLower in~ ("senseir.exe", "powershell.exe", "mssense.exe")
+        or InitiatingProcessCommandLineLower contains @"windows defender advanced threat protection"
+    )
+    and not(HasExternalUrl)
+    and not(HasDownloadCradle)
+    and not(ProcessCommandLineLower contains "frombase64string")
+    and not(ProcessCommandLineLower contains "[convert]::frombase64string")
+    and not(ProcessCommandLineLower contains "[system.convert]::frombase64string")
+
+// Optional suppression 5:
+// Local Codex/dev-tool localhost web server check.
+// Enable only after Codex is approved in your environment.
+// | extend IsApprovedCodexLocalhostWebCheck =
+//     InitiatingProcessFileNameLower startswith "codex-command-runner"
+//     and ProcessCommandLineLower contains "invoke-webrequest"
+//     and HasLocalhostUrl
+//     and not(HasExternalUrl)
+//     and not(HasEncodingOrObfuscation)
+//     and not(ProcessCommandLineLower contains "frombase64string")
+//     and not(HasFileStaging)
+
+// Suspicious parent.
+| extend IsSuspiciousParent =
+    InitiatingProcessFileNameLower in~ (SuspiciousParents)
+
+// Suspicion score.
+| extend SuspicionScore =
+    iff(HasPublicUrl, 2, iff(HasExternalUrl, 1, 0))
+    + iff(HasDownloadCradle, 1, 0)
+    + iff(HasExecution, 1, 0)
+    + iff(HasEncodingOrObfuscation, 1, 0)
+    + iff(HasEvasion, 1, 0)
+    + iff(HasFileStaging, 1, 0)
+    + iff(HasSuspiciousDownloadExtension, 1, 0)
+    + iff(IsSuspiciousParent, 1, 0)
+
+// Higher-confidence combinations.
+| extend IsDownloadExecute =
+    (HasExternalUrl or HasDownloadCradle)
+    and HasExecution
+    and not(HasLocalhostUrl)
+
+| extend IsEncodedPowerShell =
+    HasEncodingOrObfuscation
+    and (
+        IsSuspiciousParent
+        or HasExternalUrl
+        or HasDownloadCradle
+        or HasExecution
+        or HasEvasion
+        or HasFileStaging
+        or ProcessCommandLineLower contains "frombase64string"
+    )
+
+| extend IsStandaloneEncodedPowerShell =
+    HasEncodingOrObfuscation
+    and not(IsEncodedPowerShell)
+
+| extend IsDownloadWithEvasion =
+    HasExternalUrl
+    and HasEvasion
+
+| extend IsDownloadWithStaging =
+    (
+        HasExternalUrl
+        or HasDownloadCradle
+    )
+    and HasFileStaging
+
+| extend IsOfficeOrScriptParentLaunchingPowerShell =
+    IsSuspiciousParent
+    and (
+        HasExternalUrl
+        or HasDownloadCradle
+        or HasExecution
+        or HasEncodingOrObfuscation
+        or HasFileStaging
+    )
+
+// Suppress confirmed legitimate patterns.
+| where not(IsAzureArcGuestConfigurationOsVersionCheck)
+| where not(IsSccmDeliveryOptimizationStatusCheck)
+| where not(IsMdeManagedPowerShellScript)
+| where not(IsMdePowerShellScriptWrapper)
+
+// Optional Codex suppression.
+// Enable only after approval.
+// | where not(IsApprovedCodexLocalhostWebCheck)
+
+// Alert.
+| where
+    IsDownloadExecute
+    or IsEncodedPowerShell
+    or IsDownloadWithEvasion
+    or IsDownloadWithStaging
+    or IsOfficeOrScriptParentLaunchingPowerShell
+    or SuspicionScore >= 4
+
+| extend DetectionReason = case(
+    IsDownloadExecute,
+        "PowerShell download cradle combined with execution",
+    IsDownloadWithEvasion,
+        "PowerShell external download behavior combined with evasion switches",
+    IsDownloadWithStaging,
+        "PowerShell download behavior combined with file staging",
+    IsEncodedPowerShell and IsSuspiciousParent,
+        strcat("Encoded PowerShell launched by suspicious parent: ", InitiatingProcessFileName),
+    IsOfficeOrScriptParentLaunchingPowerShell,
+        strcat("Suspicious parent launched PowerShell: ", InitiatingProcessFileName),
+    IsEncodedPowerShell,
+        "PowerShell encoded, obfuscated, or Base64 decoding behavior with additional suspicious context",
+    SuspicionScore >= 4,
+        strcat("PowerShell suspicious behavior score: ", tostring(SuspicionScore)),
+    "Suspicious PowerShell activity"
+)
+
+| extend Severity = case(
+    IsDownloadExecute, "High",
+    IsDownloadWithEvasion, "High",
+    IsEncodedPowerShell and IsSuspiciousParent, "High",
+    IsOfficeOrScriptParentLaunchingPowerShell, "High",
+    IsDownloadWithStaging and HasPublicUrl, "High",
+    IsDownloadWithStaging, "Medium",
+    IsEncodedPowerShell, "Medium",
+    SuspicionScore >= 4, "Medium",
+    "Medium"
+)
+
+| project
+    Timestamp,
+    DeviceId,
+    ReportId,
+    DeviceName,
+    FileName,
+    FolderPath,
+    ProcessCommandLine,
+    DetectionReason,
+    Severity,
+    SuspicionScore,
+    HasPublicUrl,
+    HasExternalUrl,
+    HasLocalhostUrl,
+    HasPrivateIpUrl,
+    HasDownloadCradle,
+    HasSuspiciousDownloadExtension,
+    HasExecution,
+    HasEncodingOrObfuscation,
+    IsStandaloneEncodedPowerShell,
+    HasEvasion,
+    HasFileStaging,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    InitiatingProcessAccountDomain,
+    InitiatingProcessAccountName,
+    InitiatingProcessAccountSid,
+    ProcessId,
+    InitiatingProcessId
